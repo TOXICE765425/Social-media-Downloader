@@ -6,30 +6,18 @@ ENV PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# ------------------------------------------------------------
-# System packages
-# GCC/G++ = TgCrypto build
-# FFmpeg = YouTube MP4 repair/remux
-# ------------------------------------------------------------
-
+# TgCrypto build ke liye gcc + required tools
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        gcc \
-        g++ \
-        ffmpeg \
+       gcc \
+       g++ \
+       make \
+       libc6-dev \
     && rm -rf /var/lib/apt/lists/*
-
-# ------------------------------------------------------------
-# Python dependencies
-# ------------------------------------------------------------
 
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
-
-# ------------------------------------------------------------
-# Bot
-# ------------------------------------------------------------
 
 COPY bot.py .
 
