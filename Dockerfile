@@ -6,23 +6,33 @@ ENV PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# GCC/G++ required to build TgCrypto
+# ------------------------------------------------------------
+# System packages
+# GCC/G++ = TgCrypto build
+# FFmpeg = YouTube MP4 repair/remux
+# ------------------------------------------------------------
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       gcc \
-       g++ \
+        gcc \
+        g++ \
+        ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# ------------------------------------------------------------
+# Python dependencies
+# ------------------------------------------------------------
+
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy bot
+# ------------------------------------------------------------
+# Bot
+# ------------------------------------------------------------
+
 COPY bot.py .
 
-# Render health server
 EXPOSE 10000
 
-# Start bot
 CMD ["python", "bot.py"]
