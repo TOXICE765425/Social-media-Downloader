@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: misstu-telegram-downloader
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: SUPPORT_URL
+        sync: false
+      - key: VIDEO_API_URL
+        sync: false
+      - key: MUSIC_API_URL
+        sync: false
+      - key: PORT
+        value: "10000"

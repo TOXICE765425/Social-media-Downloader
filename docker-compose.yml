@@ -1,0 +1,9 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${PORT:-10000}:10000"
+    volumes:
+      - ./tmp_data:/tmp/misstu_downloader
