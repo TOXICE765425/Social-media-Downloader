@@ -22,11 +22,6 @@ ADMIN_ID=
 SUPPORT_URL=
 VIDEO_API_URL=
 MUSIC_API_URL=
-PORT=10000
-API_TIMEOUT=60
-DOWNLOAD_TIMEOUT=300
-MAX_MUSIC_RESULTS=8
-TEMP_DIR=/tmp/misstu_downloader
 ```
 
 Every host/user should put their own Telegram credentials, support URL and API URLs here.
