@@ -910,7 +910,6 @@ async def send_welcome(client, message):
             f"Profile photo error: {e}"
         )
 
-    # If user has no DP
     await message.reply_text(
         text,
         reply_markup=keyboard,
@@ -996,8 +995,26 @@ def call_music_api(query):
 
     try:
 
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # API FORMAT:
+        # https://misstu-music-api.vercel.app/search?song=...
+        #
+        # If MUSIC_API_URL already ends with /search,
+        # don't add /search again.
+        # ----------------------------------------------------
+
+        if MUSIC_API_URL.lower().endswith("/search"):
+            endpoint = MUSIC_API_URL
+        else:
+            endpoint = f"{MUSIC_API_URL}/search"
+
+        print(
+            f"🎵 Music API Request: {endpoint}"
+        )
+
         response = requests.get(
-            MUSIC_API_URL,
+            endpoint,
             params={
                 "song": query,
             },
@@ -1008,9 +1025,43 @@ def call_music_api(query):
             },
         )
 
+        print(
+            f"🎵 Music API Status: {response.status_code}"
+        )
+
         response.raise_for_status()
 
-        return response.json(), None
+        try:
+            data = response.json()
+        except Exception:
+            print(
+                "❌ Music API returned invalid JSON:"
+            )
+            print(
+                response.text[:2000]
+            )
+            return None, "Music API returned invalid JSON."
+
+        # Debug information
+        if isinstance(data, dict):
+            print(
+                "🎵 Music API Keys:",
+                list(data.keys())
+            )
+
+            result_list = data.get(
+                "results",
+                []
+            )
+
+            print(
+                "🎵 Music Results Count:",
+                len(result_list)
+                if isinstance(result_list, list)
+                else "Not a list"
+            )
+
+        return data, None
 
     except requests.Timeout:
         return None, "Music API timed out."
@@ -1033,10 +1084,39 @@ def parse_music_results(data):
     if not isinstance(data, dict):
         return results
 
+    # Normal API:
+    # {
+    #   "success": true,
+    #   "results": [...]
+    # }
+
     api_results = data.get(
         "results",
-        [],
+        []
     )
+
+    # Extra compatibility in case API ever returns:
+    # {
+    #   "result": {
+    #       "results": [...]
+    #   }
+    # }
+
+    if not isinstance(api_results, list):
+
+        nested_result = data.get(
+            "result"
+        )
+
+        if isinstance(
+            nested_result,
+            dict
+        ):
+
+            api_results = nested_result.get(
+                "results",
+                []
+            )
 
     if not isinstance(api_results, list):
         return results
@@ -1053,7 +1133,7 @@ def parse_music_results(data):
                     "Unknown Song",
                 )
             )
-        )
+        ).strip()
 
         artists = unescape(
             str(
@@ -1062,7 +1142,7 @@ def parse_music_results(data):
                     "",
                 )
             )
-        )
+        ).strip()
 
         album = unescape(
             str(
@@ -1071,24 +1151,40 @@ def parse_music_results(data):
                     "",
                 )
             )
-        )
+        ).strip()
 
         duration = str(
             item.get(
                 "duration",
                 "",
             )
-        )
+        ).strip()
 
+        # MAIN MUSIC API FIELD
         download_url = item.get(
             "download_url"
         )
+
+        # Compatibility with other possible naming
+        if not download_url:
+            download_url = item.get(
+                "downloadUrl"
+            )
+
+        if not download_url:
+            download_url = item.get(
+                "url"
+            )
 
         if not isinstance(
             download_url,
             str,
         ):
             continue
+
+        download_url = unescape(
+            download_url
+        ).strip()
 
         if not download_url.startswith(
             ("http://", "https://")
@@ -1097,13 +1193,17 @@ def parse_music_results(data):
 
         results.append(
             {
-                "title": title,
-                "artists": artists,
-                "album": album,
-                "duration": duration,
+                "title": title or "Unknown Song",
+                "artists": artists or "Unknown Artist",
+                "album": album or "Unknown Album",
+                "duration": duration or "Unknown",
                 "download_url": download_url,
             }
         )
+
+    print(
+        f"🎵 Parsed music results: {len(results)}"
+    )
 
     return results[:MAX_MUSIC_RESULTS]
 
@@ -1161,7 +1261,8 @@ async def music_handler(client, message):
     if not results:
 
         await status.edit_text(
-            "❌ **No music result found.**"
+            "❌ **No music result found.**\n\n"
+            "Try another song name."
         )
 
         return
@@ -1190,7 +1291,6 @@ async def music_handler(client, message):
             ]
         )
 
-    # Music result page can also have support
     buttons.append(
         [
             InlineKeyboardButton(
@@ -1281,7 +1381,7 @@ async def music_callback(
 
     input_file = (
         TEMP_DIR
-        / f"{base_name}.mp4"
+        / f"{base_name}.source"
     )
 
     mp3_file = (
@@ -1332,7 +1432,7 @@ async def music_callback(
             return
 
         # ----------------------------------------------------
-        # CONVERT MP4 -> MP3
+        # CONVERT TO MP3
         # ----------------------------------------------------
 
         await status.edit_text(
