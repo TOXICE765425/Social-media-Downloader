@@ -6,13 +6,9 @@ ENV PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# TgCrypto build ke liye gcc + required tools
+# FFmpeg required for MP3 conversion
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-       gcc \
-       g++ \
-       make \
-       libc6-dev \
+    && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
