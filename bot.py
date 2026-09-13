@@ -835,20 +835,11 @@ async def send_welcome(client, message):
         f"👋 **Welcome, {first_name}!**\n\n"
 
         "🚀 **Social Media Downloader**\n\n"
-
-        "📥 Send me any supported video link "
-        "and I'll download it for you.\n\n"
-
-        "🎬 **Supported Platforms**\n"
-        "• YouTube\n"
-        "• Instagram\n"
-        "• Facebook\n"
-        "• TikTok\n\n"
+        
+        "💁 Any Problem:- /help \n\n"
 
         "🎵 Search music with:\n"
         "`/music song name`\n\n"
-
-        "👇 Choose Support if you need help."
     )
 
     # ONLY ONE BUTTON
@@ -1493,7 +1484,7 @@ async def music_callback(
             f"💿 {item['album']}\n"
             f"⏱ {item['duration']}\n"
             f"📦 {human_size(mp3_size)}\n\n"
-            "⚡ Powered by Misstu"
+            "⚡ Powered by :- Misstu"
         )
 
         await callback_query.message.reply_audio(
