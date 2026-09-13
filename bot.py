@@ -1,22 +1,25 @@
 import os
 import re
 import json
-import time
 import asyncio
 import tempfile
 import threading
+import subprocess
 from pathlib import Path
-from urllib.parse import quote
+from datetime import datetime
+from html import unescape
 
 import requests
-from flask import Flask, jsonify
+from flask import Flask
+
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import FloodWait
 
 
-# =========================================================
-# ENV — ONLY THESE 7
-# =========================================================
+# ============================================================
+# ENVIRONMENT VARIABLES — ONLY THESE 7
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_ID = int(os.getenv("API_ID", "0"))
@@ -28,54 +31,79 @@ MUSIC_API_URL = os.getenv("MUSIC_API_URL", "").strip().rstrip("/")
 SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()
 
 
-# =========================================================
-# SETTINGS
-# =========================================================
-
-PORT = int(os.getenv("PORT", "10000"))
-
-API_TIMEOUT = 60
-DOWNLOAD_TIMEOUT = 300
-
-MAX_DOWNLOAD_SIZE = 49 * 1024 * 1024
-
-TEMP_DIR = Path(tempfile.gettempdir()) / "social_media_downloader"
-TEMP_DIR.mkdir(parents=True, exist_ok=True)
-
-USER_DB = TEMP_DIR / "users.json"
-
-
-# =========================================================
-# CHECK ENV
-# =========================================================
+# ============================================================
+# VALIDATION
+# ============================================================
 
 missing = []
 
-for name, value in [
-    ("BOT_TOKEN", BOT_TOKEN),
-    ("API_ID", API_ID),
-    ("API_HASH", API_HASH),
-    ("ADMIN_ID", ADMIN_ID),
-    ("VIDEO_API_URL", VIDEO_API_URL),
-    ("MUSIC_API_URL", MUSIC_API_URL),
-    ("SUPPORT_URL", SUPPORT_URL),
-]:
-    if not value:
-        missing.append(name)
+if not BOT_TOKEN:
+    missing.append("BOT_TOKEN")
+
+if not API_ID:
+    missing.append("API_ID")
+
+if not API_HASH:
+    missing.append("API_HASH")
+
+if not ADMIN_ID:
+    missing.append("ADMIN_ID")
+
+if not VIDEO_API_URL:
+    missing.append("VIDEO_API_URL")
+
+if not MUSIC_API_URL:
+    missing.append("MUSIC_API_URL")
+
+if not SUPPORT_URL:
+    missing.append("SUPPORT_URL")
 
 if missing:
     raise RuntimeError(
-        "Missing environment variables: "
+        "Missing Environment Variables: "
         + ", ".join(missing)
     )
 
 
-# =========================================================
-# USER DATABASE
-# =========================================================
+# ============================================================
+# SETTINGS
+# ============================================================
+
+API_TIMEOUT = 60
+DOWNLOAD_TIMEOUT = 300
+
+MAX_TELEGRAM_FILE = 49 * 1024 * 1024
+MAX_MUSIC_RESULTS = 10
+
+TEMP_DIR = Path(tempfile.gettempdir()) / "misstu_downloader"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+USER_DB = TEMP_DIR / "users.json"
+
+SUPPORTED_PLATFORMS = {
+    "youtube": [
+        "youtube.com",
+        "youtu.be",
+    ],
+    "instagram": [
+        "instagram.com",
+    ],
+    "tiktok": [
+        "tiktok.com",
+    ],
+    "facebook": [
+        "facebook.com",
+        "fb.watch",
+    ],
+}
+
+
+# ============================================================
+# DATABASE
+# ============================================================
 
 users = {}
-users_lock = threading.Lock()
+music_cache = {}
 
 
 def load_users():
@@ -90,995 +118,1009 @@ def load_users():
                 users = data
 
     except Exception as e:
-        print("User DB load error:", e)
+        print(f"⚠️ User database load error: {e}")
         users = {}
 
 
 def save_users():
     try:
-        USER_DB.parent.mkdir(
-            parents=True,
-            exist_ok=True
-        )
+        tmp_file = USER_DB.with_suffix(".tmp")
 
-        tmp = USER_DB.with_suffix(".tmp")
-
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(
                 users,
                 f,
+                indent=2,
                 ensure_ascii=False,
-                indent=2
             )
 
-        tmp.replace(USER_DB)
+        tmp_file.replace(USER_DB)
 
     except Exception as e:
-        print("User DB save error:", e)
+        print(f"⚠️ User database save error: {e}")
 
 
 def register_user(user):
-
     if not user:
         return
 
-    try:
-        uid = str(user.id)
+    user_id = str(user.id)
 
-        with users_lock:
+    old = users.get(user_id, {})
 
-            old = users.get(uid, {})
+    full_name = " ".join(
+        x for x in [
+            user.first_name or "",
+            user.last_name or "",
+        ]
+        if x
+    ).strip()
 
-            users[uid] = {
-                "user_id": user.id,
-                "first_name": user.first_name or "",
-                "last_name": user.last_name or "",
-                "full_name": (
-                    f"{user.first_name or ''} "
-                    f"{user.last_name or ''}"
-                ).strip(),
-                "username": user.username or "",
-                "is_bot": bool(user.is_bot),
-                "first_seen": old.get(
-                    "first_seen",
-                    int(time.time())
-                ),
-                "last_seen": int(time.time())
-            }
+    users[user_id] = {
+        "user_id": user.id,
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+        "full_name": full_name or "Unknown",
+        "username": user.username or "",
+        "is_bot": bool(user.is_bot),
+        "first_seen": old.get(
+            "first_seen",
+            datetime.utcnow().isoformat(),
+        ),
+        "last_seen": datetime.utcnow().isoformat(),
+    }
 
-            save_users()
-
-    except Exception as e:
-        print("Register error:", e)
-
-
-load_users()
+    save_users()
 
 
-# =========================================================
+# ============================================================
 # FLASK HEALTH SERVER
-# =========================================================
+# ============================================================
 
-health_app = Flask(__name__)
+flask_app = Flask(__name__)
 
 
-@health_app.route("/")
+@flask_app.route("/")
 def home():
-
-    return jsonify({
-        "status": "online",
-        "service": "Social Media Downloader"
-    })
+    return "Misstu Social Media Bot is running."
 
 
-@health_app.route("/health")
+@flask_app.route("/health")
 def health():
+    return {
+        "status": "ok",
+        "users": len(users),
+    }
 
-    return jsonify({
-        "status": "ok"
-    }), 200
 
+def run_flask():
+    port = int(os.getenv("PORT", "10000"))
 
-def run_health_server():
-
-    health_app.run(
+    flask_app.run(
         host="0.0.0.0",
-        port=PORT,
-        threaded=True,
-        use_reloader=False
+        port=port,
     )
 
 
-threading.Thread(
-    target=run_health_server,
-    daemon=True
-).start()
-
-
-# =========================================================
+# ============================================================
 # PYROGRAM
-# =========================================================
+# ============================================================
 
-bot = Client(
-    "social_media_downloader",
+app = Client(
+    "misstu_downloader_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     in_memory=True,
     ipv6=False,
-    max_concurrent_transmissions=1
+    max_concurrent_transmissions=1,
 )
 
 
-# =========================================================
-# KEYBOARDS
-# =========================================================
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
 
-def main_keyboard():
-
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "📥 Download Video",
-                callback_data="download"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🎵 Music Search",
-                callback_data="music"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📢 Support",
-                url=SUPPORT_URL
-            )
-        ]
-    ])
-
-
-def back_keyboard():
-
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🔙 Back",
-                callback_data="home"
-            )
-        ]
-    ])
-
-
-# =========================================================
-# USER PROFILE PHOTO
-# =========================================================
-
-async def download_user_photo(user):
-
-    try:
-
-        chat = await bot.get_chat(user.id)
-
-        if not chat.photo:
-            return None
-
-        photo_path = TEMP_DIR / (
-            f"user_dp_{user.id}_{int(time.time())}.jpg"
-        )
-
-        downloaded = await bot.download_media(
-            chat.photo.big_file_id,
-            file_name=str(photo_path)
-        )
-
-        return downloaded
-
-    except Exception as e:
-
-        print(
-            "User profile photo error:",
-            repr(e)
-        )
-
+def extract_url(text):
+    if not text:
         return None
 
-
-# =========================================================
-# WELCOME
-# =========================================================
-
-async def show_welcome(
-    chat_id,
-    user,
-    message_to_edit=None
-):
-
-    name = user.first_name or "User"
-
-    text = (
-        f"👋 **Welcome, {name}!**\n\n"
-        "⚡ **Social Media Downloader**\n\n"
-        "📥 Download videos from:\n"
-        "• Instagram\n"
-        "• YouTube\n"
-        "• TikTok\n"
-        "• Facebook\n\n"
-        "🎵 Search music with:\n"
-        "`/music song name`\n\n"
-        "👇 Choose an option below."
+    match = re.search(
+        r"https?://[^\s<>\"]+",
+        text,
+        re.IGNORECASE,
     )
 
-    # If coming back from button, edit message
-    if message_to_edit:
+    if not match:
+        return None
 
-        try:
-
-            await message_to_edit.edit_text(
-                text,
-                reply_markup=main_keyboard()
-            )
-
-            return
-
-        except Exception as e:
-            print("Welcome edit error:", repr(e))
-
-    # Otherwise send user's own profile DP
-    photo = await download_user_photo(user)
-
-    try:
-
-        if photo and os.path.exists(photo):
-
-            await bot.send_photo(
-                chat_id=chat_id,
-                photo=photo,
-                caption=text,
-                reply_markup=main_keyboard()
-            )
-
-        else:
-
-            await bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_markup=main_keyboard()
-            )
-
-    except Exception as e:
-
-        print(
-            "Welcome photo send error:",
-            repr(e)
-        )
-
-        try:
-
-            await bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_markup=main_keyboard()
-            )
-
-        except Exception:
-            pass
-
-    finally:
-
-        if photo and os.path.exists(photo):
-
-            try:
-                os.remove(photo)
-            except Exception:
-                pass
-
-
-# =========================================================
-# START
-# =========================================================
-
-@bot.on_message(
-    filters.private & filters.command("start")
-)
-async def start_handler(client, message):
-
-    register_user(message.from_user)
-
-    await show_welcome(
-        message.chat.id,
-        message.from_user
+    return match.group(0).strip().rstrip(
+        ".,!?)]}\"'"
     )
-
-
-# =========================================================
-# HELP
-# =========================================================
-
-@bot.on_message(
-    filters.private & filters.command("help")
-)
-async def help_handler(client, message):
-
-    register_user(message.from_user)
-
-    await message.reply_text(
-        "📥 **Social Media Downloader**\n\n"
-        "Send an Instagram, YouTube, TikTok "
-        "or Facebook video link.\n\n"
-        "🎵 Music:\n"
-        "`/music song name`",
-        reply_markup=main_keyboard()
-    )
-
-
-# =========================================================
-# CALLBACK
-# =========================================================
-
-@bot.on_callback_query()
-async def callback_handler(client, query):
-
-    register_user(query.from_user)
-
-    try:
-
-        if query.data == "home":
-
-            await query.answer()
-
-            await show_welcome(
-                query.message.chat.id,
-                query.from_user,
-                query.message
-            )
-
-        elif query.data == "download":
-
-            await query.answer()
-
-            await query.message.edit_text(
-                "📥 **Video Downloader**\n\n"
-                "Simply send the video link.\n\n"
-                "Supported:\n"
-                "• Instagram\n"
-                "• YouTube\n"
-                "• TikTok\n"
-                "• Facebook",
-                reply_markup=back_keyboard()
-            )
-
-        elif query.data == "music":
-
-            await query.answer()
-
-            await query.message.edit_text(
-                "🎵 **Music Search**\n\n"
-                "Use:\n"
-                "`/music song name`\n\n"
-                "Example:\n"
-                "`/music Arijit Singh`",
-                reply_markup=back_keyboard()
-            )
-
-    except Exception as e:
-
-        print(
-            "Callback error:",
-            repr(e)
-        )
-
-
-# =========================================================
-# URL DETECTION
-# =========================================================
-
-URL_PATTERN = re.compile(
-    r"https?://[^\s<>]+",
-    re.IGNORECASE
-)
 
 
 def detect_platform(url):
+    url_lower = url.lower()
 
-    u = url.lower()
-
-    if "instagram.com" in u:
-        return "instagram"
-
-    if "youtu.be" in u or "youtube.com" in u:
-        return "youtube"
-
-    if "tiktok.com" in u:
-        return "tiktok"
-
-    if (
-        "facebook.com" in u
-        or "fb.watch" in u
-    ):
-        return "facebook"
+    for platform, domains in SUPPORTED_PLATFORMS.items():
+        for domain in domains:
+            if domain in url_lower:
+                return platform
 
     return None
 
 
-# =========================================================
-# VIDEO API
-# =========================================================
-
-def call_video_api(platform, url):
-
-    api_url = (
-        f"{VIDEO_API_URL}/api/"
-        f"{platform}?url={quote(url, safe='')}"
+def safe_filename(name):
+    name = re.sub(
+        r'[\\/*?:"<>|]',
+        "_",
+        name,
     )
 
-    print(
-        f"[VIDEO API] {platform}:",
-        api_url
-    )
+    name = name.strip()
 
-    response = requests.get(
-        api_url,
-        timeout=API_TIMEOUT,
-        headers={
-            "User-Agent": "Mozilla/5.0"
-        }
-    )
+    if not name:
+        name = "download"
 
-    response.raise_for_status()
-
-    data = response.json()
-
-    print(
-        "[VIDEO API RESPONSE]",
-        json.dumps(
-            data,
-            ensure_ascii=False
-        )[:3000]
-    )
-
-    return data
+    return name[:120]
 
 
-# =========================================================
-# URL CHECK
-# =========================================================
+def human_size(size):
+    try:
+        size = float(size)
 
-def valid_http_url(value):
+        if size < 1024:
+            return f"{size:.0f} B"
 
-    if not isinstance(value, str):
-        return False
+        if size < 1024 * 1024:
+            return f"{size / 1024:.1f} KB"
 
-    return value.startswith(
-        ("http://", "https://")
-    )
+        if size < 1024 * 1024 * 1024:
+            return f"{size / (1024 * 1024):.1f} MB"
 
+        return f"{size / (1024 * 1024 * 1024):.2f} GB"
 
-# =========================================================
-# GET VIDEO
-# =========================================================
-
-def get_video_url(data, platform):
-
-    # -----------------------------------------------------
-    # FACEBOOK
-    # -----------------------------------------------------
-
-    if platform == "facebook":
-
-        result = data.get("result", {})
-
-        if isinstance(result, dict):
-
-            hd = result.get("hdUrl")
-
-            if valid_http_url(hd):
-                return hd, "HD"
-
-            sd = result.get("sdUrl")
-
-            if valid_http_url(sd):
-                return sd, "SD"
+    except Exception:
+        return "Unknown"
 
 
-    # -----------------------------------------------------
-    # INSTAGRAM
-    # -----------------------------------------------------
+# ============================================================
+# RECURSIVE VIDEO URL FINDER
+# ============================================================
 
-    if platform == "instagram":
+def recursive_urls(obj):
+    found = []
 
-        result = data.get(
-            "result",
-            {}
-        )
+    if isinstance(obj, dict):
 
-        if isinstance(result, dict):
+        for key, value in obj.items():
 
-            videos = result.get(
-                "videos",
-                []
-            )
+            key_lower = str(key).lower()
 
-            if isinstance(videos, list):
+            if isinstance(value, str):
 
-                # First prefer HD
-                for item in videos:
+                if value.startswith(
+                    ("http://", "https://")
+                ):
 
-                    if not isinstance(item, dict):
-                        continue
-
-                    url = item.get("url")
-
-                    quality = str(
-                        item.get("quality", "")
-                    ).lower()
+                    value_lower = value.lower()
 
                     if (
-                        valid_http_url(url)
-                        and quality == "hd"
-                    ):
-
-                        return url, "HD"
-
-                # Then any valid video URL
-                for item in videos:
-
-                    if not isinstance(item, dict):
-                        continue
-
-                    url = item.get("url")
-
-                    if valid_http_url(url):
-
-                        return (
-                            url,
-                            item.get(
-                                "quality",
-                                "Video"
-                            )
+                        ".mp4" in value_lower
+                        or ".m3u8" in value_lower
+                        or ".webm" in value_lower
+                        or ".mov" in value_lower
+                        or ".mkv" in value_lower
+                        or "video" in key_lower
+                        or "download" in key_lower
+                        or "media" in key_lower
+                        or key_lower in (
+                            "url",
+                            "hdurl",
+                            "sdurl",
+                            "videourl",
                         )
+                    ):
+                        found.append(value)
 
-
-    # -----------------------------------------------------
-    # YOUTUBE
-    # -----------------------------------------------------
-
-    if platform == "youtube":
-
-        result = data.get(
-            "result",
-            {}
-        )
-
-        if isinstance(result, dict):
-
-            video_data = result.get(
-                "video",
-                {}
-            )
-
-            if isinstance(video_data, dict):
-
-                videos = video_data.get(
-                    "videos",
-                    []
+            elif isinstance(value, (dict, list)):
+                found.extend(
+                    recursive_urls(value)
                 )
 
-                if isinstance(videos, list):
+    elif isinstance(obj, list):
 
-                    # Prefer streams with audio
-                    # and no merge requirement
-                    for item in videos:
+        for item in obj:
+            found.extend(
+                recursive_urls(item)
+            )
 
-                        if not isinstance(item, dict):
-                            continue
+    return found
 
-                        url = item.get("url")
 
-                        if not valid_http_url(url):
-                            continue
+# ============================================================
+# YOUTUBE PARSER
+# ============================================================
 
-                        has_audio = (
-                            item.get("hasAudio") is True
-                            or
-                            item.get("audioAvailable") is True
-                        )
+def get_youtube_videos(data):
 
-                        needs_merge = (
-                            item.get("needsMerge") is True
-                        )
-
-                        if has_audio and not needs_merge:
-
-                            quality = (
-                                item.get("qualityLabel")
-                                or item.get("quality")
-                                or "YouTube"
-                            )
-
-                            return url, str(quality)
-
-                    # Fallback to any video URL
-                    for item in videos:
-
-                        if not isinstance(item, dict):
-                            continue
-
-                        url = item.get("url")
-
-                        if valid_http_url(url):
-
-                            quality = (
-                                item.get("qualityLabel")
-                                or item.get("quality")
-                                or "YouTube"
-                            )
-
-                            return url, str(quality)
-
-
-    # -----------------------------------------------------
-    # GENERIC RECURSIVE SEARCH
-    # -----------------------------------------------------
-
-    def walk(obj):
-
-        if isinstance(obj, dict):
-
-            # Ignore obvious non-video fields
-            ignored = {
-                "thumbnail",
-                "cover",
-                "image",
-                "avatar",
-                "music"
-            }
-
-            for key, value in obj.items():
-
-                key_lower = str(key).lower()
-
-                if key_lower in ignored:
-                    continue
-
-                if isinstance(value, str):
-
-                    if (
-                        valid_http_url(value)
-                        and (
-                            "video" in key_lower
-                            or
-                            key_lower in {
-                                "url",
-                                "videourl",
-                                "video_url",
-                                "downloadurl",
-                                "download_url",
-                                "hdurl",
-                                "sdurl"
-                            }
-                        )
-                    ):
-
-                        return value
-
-                result = walk(value)
-
-                if result:
-                    return result
-
-        elif isinstance(obj, list):
-
-            for item in obj:
-
-                result = walk(item)
-
-                if result:
-                    return result
-
-        return None
-
-
-    generic = walk(data)
-
-    if generic:
-        return generic, "Auto"
-
-    return None, None
-
-
-# =========================================================
-# DOWNLOAD FILE
-# =========================================================
-
-def download_file(
-    url,
-    output_path,
-    max_size=MAX_DOWNLOAD_SIZE
-):
-
-    print(
-        "[DOWNLOAD]",
-        url[:300]
-    )
-
-    with requests.get(
-        url,
-        stream=True,
-        timeout=DOWNLOAD_TIMEOUT,
-        headers={
-            "User-Agent": "Mozilla/5.0"
-        }
-    ) as response:
-
-        response.raise_for_status()
-
-        total = 0
-
-        with open(
-            output_path,
-            "wb"
-        ) as f:
-
-            for chunk in response.iter_content(
-                chunk_size=256 * 1024
-            ):
-
-                if not chunk:
-                    continue
-
-                total += len(chunk)
-
-                if (
-                    max_size
-                    and total > max_size
-                ):
-                    raise ValueError(
-                        "File is larger than "
-                        "Telegram upload limit."
-                    )
-
-                f.write(chunk)
-
-    return output_path
-
-
-# =========================================================
-# VIDEO HANDLER
-# =========================================================
-
-@bot.on_message(
-    filters.text
-    & ~filters.command([
-        "start",
-        "help",
-        "music",
-        "user",
-        "users",
-        "broadcast"
-    ])
-)
-async def video_handler(client, message):
-
-    register_user(message.from_user)
-
-    text = message.text or ""
-
-    match = URL_PATTERN.search(text)
-
-    if not match:
-        return
-
-    url = match.group(0)
-
-    # Remove Telegram punctuation
-    url = url.rstrip(
-        ".,!?)]}>"
-    )
-
-    platform = detect_platform(url)
-
-    if not platform:
-        return
-
-    status = await message.reply_text(
-        "⏳ **Processing...**\n\n"
-        "🔎 Searching video..."
-    )
-
-    file_path = None
+    videos = []
 
     try:
 
-        data = call_video_api(
-            platform,
-            url
+        result = data.get("result", {})
+        video = result.get("video", {})
+
+        video_list = video.get(
+            "videos",
+            [],
         )
 
-        video_url, quality = get_video_url(
-            data,
-            platform
-        )
+        if isinstance(video_list, list):
 
-        if not video_url:
+            for item in video_list:
 
-            raise ValueError(
-                "No downloadable video found."
+                if not isinstance(item, dict):
+                    continue
+
+                url = item.get("url")
+
+                if not isinstance(url, str):
+                    continue
+
+                if not url.startswith(
+                    ("http://", "https://")
+                ):
+                    continue
+
+                quality = str(
+                    item.get("quality", "")
+                )
+
+                quality_label = str(
+                    item.get("qualityLabel", "")
+                )
+
+                has_audio = bool(
+                    item.get(
+                        "hasAudio",
+                        item.get(
+                            "audioAvailable",
+                            False,
+                        ),
+                    )
+                )
+
+                needs_merge = bool(
+                    item.get(
+                        "needsMerge",
+                        False,
+                    )
+                )
+
+                videos.append({
+                    "url": url,
+                    "quality": quality,
+                    "qualityLabel": quality_label,
+                    "hasAudio": has_audio,
+                    "needsMerge": needs_merge,
+                })
+
+    except Exception as e:
+        print(f"YouTube parser error: {e}")
+
+    return videos
+
+
+def choose_youtube_video(data):
+
+    videos = get_youtube_videos(data)
+
+    if not videos:
+        return None
+
+    progressive = [
+        x for x in videos
+        if x["hasAudio"] and not x["needsMerge"]
+    ]
+
+    if progressive:
+        videos = progressive
+
+    def quality_score(item):
+
+        text = (
+            str(item.get("quality", ""))
+            + " "
+            + str(item.get("qualityLabel", ""))
+        ).lower()
+
+        score = 0
+
+        if "2160" in text:
+            score += 2160
+        elif "1440" in text:
+            score += 1440
+        elif "1080" in text:
+            score += 1080
+        elif "720" in text:
+            score += 720
+        elif "480" in text:
+            score += 480
+        elif "360" in text:
+            score += 360
+        elif "240" in text:
+            score += 240
+
+        if item["hasAudio"]:
+            score += 10000
+
+        if not item["needsMerge"]:
+            score += 5000
+
+        return score
+
+    videos.sort(
+        key=quality_score,
+        reverse=True,
+    )
+
+    return videos[0]["url"]
+
+
+# ============================================================
+# GENERAL VIDEO PARSER
+# ============================================================
+
+def find_video_urls(data):
+
+    urls = []
+
+    result = (
+        data.get("result")
+        if isinstance(data, dict)
+        else None
+    )
+
+    if isinstance(result, dict):
+
+        for key in (
+            "hdUrl",
+            "sdUrl",
+            "videoUrl",
+            "downloadUrl",
+        ):
+
+            value = result.get(key)
+
+            if (
+                isinstance(value, str)
+                and value.startswith(
+                    ("http://", "https://")
+                )
+            ):
+                urls.append(value)
+
+        videos = result.get("videos")
+
+        if isinstance(videos, list):
+
+            for item in videos:
+
+                if not isinstance(item, dict):
+                    continue
+
+                value = item.get("url")
+
+                if (
+                    isinstance(value, str)
+                    and value.startswith(
+                        ("http://", "https://")
+                    )
+                ):
+                    urls.append(value)
+
+        nested_video = result.get("video")
+
+        if isinstance(nested_video, dict):
+
+            for key in (
+                "hdUrl",
+                "sdUrl",
+                "videoUrl",
+                "downloadUrl",
+                "url",
+            ):
+
+                value = nested_video.get(key)
+
+                if (
+                    isinstance(value, str)
+                    and value.startswith(
+                        ("http://", "https://")
+                    )
+                ):
+                    urls.append(value)
+
+            nested_videos = nested_video.get(
+                "videos"
             )
 
-        await status.edit_text(
-            "⬇️ **Downloading video...**\n\n"
-            f"🎬 Platform: `{platform.title()}`\n"
-            f"🎞 Quality: `{quality}`"
+            if isinstance(nested_videos, list):
+
+                for item in nested_videos:
+
+                    if not isinstance(item, dict):
+                        continue
+
+                    value = item.get("url")
+
+                    if (
+                        isinstance(value, str)
+                        and value.startswith(
+                            ("http://", "https://")
+                        )
+                    ):
+                        urls.append(value)
+
+    urls.extend(
+        recursive_urls(data)
+    )
+
+    unique = []
+
+    for url in urls:
+        if url not in unique:
+            unique.append(url)
+
+    return unique
+
+
+def choose_best_video(data, platform):
+
+    if platform == "youtube":
+
+        yt_url = choose_youtube_video(data)
+
+        if yt_url:
+            return yt_url
+
+    urls = find_video_urls(data)
+
+    if not urls:
+        return None
+
+    def score(url):
+
+        u = url.lower()
+        points = 0
+
+        if "hd" in u:
+            points += 10
+
+        if "1080" in u:
+            points += 15
+        elif "720" in u:
+            points += 10
+
+        if ".mp4" in u:
+            points += 5
+
+        return points
+
+    return sorted(
+        urls,
+        key=score,
+        reverse=True,
+    )[0]
+
+
+# ============================================================
+# VIDEO API
+# ============================================================
+
+def call_video_api(platform, original_url):
+
+    endpoint = (
+        f"{VIDEO_API_URL}/api/{platform}"
+    )
+
+    try:
+
+        response = requests.get(
+            endpoint,
+            params={
+                "url": original_url,
+            },
+            timeout=API_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+            },
         )
 
-        file_path = TEMP_DIR / (
-            f"video_"
-            f"{message.from_user.id}_"
-            f"{int(time.time())}.mp4"
+        response.raise_for_status()
+
+        try:
+            return response.json(), None
+        except Exception:
+            return None, "API returned invalid JSON."
+
+    except requests.Timeout:
+        return None, "API request timed out."
+
+    except requests.RequestException as e:
+        return None, f"API request failed: {e}"
+
+    except Exception as e:
+        return None, f"Unexpected API error: {e}"
+
+
+# ============================================================
+# DOWNLOAD FILE
+# ============================================================
+
+def download_file(url, output_path):
+
+    try:
+
+        with requests.get(
+            url,
+            stream=True,
+            timeout=DOWNLOAD_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+            },
+        ) as response:
+
+            response.raise_for_status()
+
+            total = 0
+
+            with open(output_path, "wb") as f:
+
+                for chunk in response.iter_content(
+                    chunk_size=1024 * 256
+                ):
+
+                    if not chunk:
+                        continue
+
+                    f.write(chunk)
+                    total += len(chunk)
+
+                    if total > (
+                        2 * 1024 * 1024 * 1024
+                    ):
+                        raise RuntimeError(
+                            "File is larger than 2 GB."
+                        )
+
+        return True, total, None
+
+    except requests.Timeout:
+        return False, 0, "Download timed out."
+
+    except requests.RequestException as e:
+        return False, 0, f"Download failed: {e}"
+
+    except Exception as e:
+        return False, 0, str(e)
+
+
+# ============================================================
+# FFMPEG REMUX VIDEO
+# ============================================================
+
+def remux_video(input_file, output_file):
+
+    try:
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_file),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(output_file),
+        ]
+
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=180,
         )
 
-        download_file(
-            video_url,
-            file_path
+        if result.returncode == 0:
+            if output_file.exists():
+                if output_file.stat().st_size > 0:
+                    return True
+
+    except Exception as e:
+        print(f"FFmpeg remux error: {e}")
+
+    return False
+
+
+# ============================================================
+# MUSIC -> MP3 CONVERTER
+# ============================================================
+
+def convert_to_mp3(input_file, output_file):
+
+    try:
+
+        command = [
+            "ffmpeg",
+            "-y",
+
+            "-i",
+            str(input_file),
+
+            "-vn",
+
+            "-codec:a",
+            "libmp3lame",
+
+            "-b:a",
+            "192k",
+
+            "-map_metadata",
+            "0",
+
+            str(output_file),
+        ]
+
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=300,
         )
 
-        size_mb = (
-            file_path.stat().st_size
-            / (1024 * 1024)
+        if result.returncode == 0:
+
+            if output_file.exists():
+
+                if output_file.stat().st_size > 0:
+                    return True, None
+
+        error_text = (
+            result.stderr.decode(
+                "utf-8",
+                errors="ignore",
+            )[-1000:]
         )
 
-        await status.edit_text(
-            "📤 **Uploading to Telegram...**"
+        print(
+            "FFmpeg MP3 error:",
+            error_text,
         )
 
-        caption = (
-            f"🎬 **{platform.title()} Video**\n\n"
-            f"🎞 Quality: `{quality}`\n"
-            f"📦 Size: `{size_mb:.1f} MB`\n\n"
-            "⚡ Powered by **Misstu**"
+        return False, "FFmpeg MP3 conversion failed."
+
+    except subprocess.TimeoutExpired:
+        return False, "MP3 conversion timed out."
+
+    except FileNotFoundError:
+        return False, "FFmpeg is not installed."
+
+    except Exception as e:
+        return False, str(e)
+
+
+# ============================================================
+# START WELCOME
+# ============================================================
+
+async def send_welcome(client, message):
+
+    user = message.from_user
+
+    if not user:
+        return
+
+    register_user(user)
+
+    first_name = (
+        user.first_name
+        or "User"
+    )
+
+    text = (
+        f"👋 **Welcome, {first_name}!**\n\n"
+
+        "🚀 **Social Media Downloader**\n\n"
+
+        "📥 Send me any supported video link "
+        "and I'll download it for you.\n\n"
+
+        "🎬 **Supported Platforms**\n"
+        "• YouTube\n"
+        "• Instagram\n"
+        "• Facebook\n"
+        "• TikTok\n\n"
+
+        "🎵 Search music with:\n"
+        "`/music song name`\n\n"
+
+        "👇 Choose Support if you need help."
+    )
+
+    # ONLY ONE BUTTON
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📢 Support",
+                    url=SUPPORT_URL,
+                )
+            ]
+        ]
+    )
+
+    photo_path = (
+        TEMP_DIR
+        / f"profile_{user.id}.jpg"
+    )
+
+    try:
+
+        full_user = await client.get_users(
+            user.id
         )
 
-        await client.send_video(
-            chat_id=message.chat.id,
-            video=str(file_path),
-            caption=caption,
-            supports_streaming=True
-        )
+        if (
+            full_user
+            and full_user.photo
+            and full_user.photo.big_file_id
+        ):
 
-        await status.delete()
+            downloaded = (
+                await client.download_media(
+                    full_user.photo.big_file_id,
+                    file_name=str(photo_path),
+                )
+            )
+
+            if downloaded:
+
+                await message.reply_photo(
+                    photo=str(downloaded),
+                    caption=text,
+                    reply_markup=keyboard,
+                )
+
+                try:
+                    Path(downloaded).unlink(
+                        missing_ok=True
+                    )
+                except Exception:
+                    pass
+
+                return
 
     except Exception as e:
 
         print(
-            f"[VIDEO ERROR] {platform}:",
-            repr(e)
+            f"Profile photo error: {e}"
         )
 
-        try:
-
-            await status.edit_text(
-                "❌ **Download failed**\n\n"
-                f"`{str(e)[:1500]}`"
-            )
-
-        except Exception:
-            pass
-
-    finally:
-
-        if file_path and file_path.exists():
-
-            try:
-                file_path.unlink()
-            except Exception:
-                pass
+    # If user has no DP
+    await message.reply_text(
+        text,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
 
 
-# =========================================================
+# ============================================================
+# START
+# ============================================================
+
+@app.on_message(
+    filters.private
+    & filters.command("start")
+)
+async def start_handler(client, message):
+
+    await send_welcome(
+        client,
+        message,
+    )
+
+
+# ============================================================
+# HELP
+# ============================================================
+
+@app.on_message(
+    filters.private
+    & filters.command("help")
+)
+async def help_handler(client, message):
+
+    register_user(
+        message.from_user
+    )
+
+    await message.reply_text(
+        "📖 **How to use**\n\n"
+
+        "🎬 **Video:**\n"
+        "Simply send a supported video link.\n\n"
+
+        "Supported:\n"
+        "• YouTube\n"
+        "• Instagram\n"
+        "• Facebook\n"
+        "• TikTok\n\n"
+
+        "🎵 **Music:**\n"
+        "`/music song name`\n\n"
+
+        "Example:\n"
+        "`/music Arijit Singh`"
+    )
+
+
+# ============================================================
+# ID
+# ============================================================
+
+@app.on_message(
+    filters.private
+    & filters.command("id")
+)
+async def id_handler(client, message):
+
+    register_user(
+        message.from_user
+    )
+
+    await message.reply_text(
+        "🆔 **Your Telegram User ID**\n\n"
+        f"`{message.from_user.id}`"
+    )
+
+
+# ============================================================
 # MUSIC API
-# =========================================================
+# ============================================================
 
-def search_music(song):
+def call_music_api(query):
 
-    api_url = (
-        f"{MUSIC_API_URL}/search"
-        f"?song={quote(song, safe='')}"
-    )
+    try:
 
-    print(
-        "[MUSIC API]",
-        api_url
-    )
-
-    response = requests.get(
-        api_url,
-        timeout=API_TIMEOUT,
-        headers={
-            "User-Agent": "Mozilla/5.0"
-        }
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    print(
-        "[MUSIC RESPONSE]",
-        json.dumps(
-            data,
-            ensure_ascii=False
-        )[:3000]
-    )
-
-    return data
-
-
-# =========================================================
-# FFMPEG MP4/AAC -> MP3
-# =========================================================
-
-def convert_to_mp3(input_file, output_file):
-
-    import subprocess
-
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_file),
-        "-vn",
-        "-codec:a",
-        "libmp3lame",
-        "-b:a",
-        "320k",
-        "-ar",
-        "44100",
-        str(output_file)
-    ]
-
-    print(
-        "[FFMPEG]",
-        " ".join(command)
-    )
-
-    process = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-
-    if process.returncode != 0:
-
-        print(
-            "[FFMPEG ERROR]",
-            process.stderr[-3000:]
+        response = requests.get(
+            MUSIC_API_URL,
+            params={
+                "song": query,
+            },
+            timeout=API_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+            },
         )
 
-        raise RuntimeError(
-            "MP3 conversion failed."
+        response.raise_for_status()
+
+        return response.json(), None
+
+    except requests.Timeout:
+        return None, "Music API timed out."
+
+    except requests.RequestException as e:
+        return None, f"Music API request failed: {e}"
+
+    except Exception as e:
+        return None, str(e)
+
+
+# ============================================================
+# MUSIC RESULT PARSER
+# ============================================================
+
+def parse_music_results(data):
+
+    results = []
+
+    if not isinstance(data, dict):
+        return results
+
+    api_results = data.get(
+        "results",
+        [],
+    )
+
+    if not isinstance(api_results, list):
+        return results
+
+    for item in api_results:
+
+        if not isinstance(item, dict):
+            continue
+
+        title = unescape(
+            str(
+                item.get(
+                    "title",
+                    "Unknown Song",
+                )
+            )
         )
 
-    if not output_file.exists():
-
-        raise RuntimeError(
-            "MP3 file was not created."
+        artists = unescape(
+            str(
+                item.get(
+                    "artists",
+                    "",
+                )
+            )
         )
 
-    return output_file
+        album = unescape(
+            str(
+                item.get(
+                    "album",
+                    "",
+                )
+            )
+        )
+
+        duration = str(
+            item.get(
+                "duration",
+                "",
+            )
+        )
+
+        download_url = item.get(
+            "download_url"
+        )
+
+        if not isinstance(
+            download_url,
+            str,
+        ):
+            continue
+
+        if not download_url.startswith(
+            ("http://", "https://")
+        ):
+            continue
+
+        results.append(
+            {
+                "title": title,
+                "artists": artists,
+                "album": album,
+                "duration": duration,
+                "download_url": download_url,
+            }
+        )
+
+    return results[:MAX_MUSIC_RESULTS]
 
 
-# =========================================================
+# ============================================================
 # MUSIC COMMAND
-# =========================================================
+# ============================================================
 
-@bot.on_message(
-    filters.private & filters.command("music")
+@app.on_message(
+    filters.private
+    & filters.command("music")
 )
 async def music_handler(client, message):
 
-    register_user(message.from_user)
+    register_user(
+        message.from_user
+    )
 
     if len(message.command) < 2:
 
@@ -1087,177 +1129,304 @@ async def music_handler(client, message):
             "Use:\n"
             "`/music song name`\n\n"
             "Example:\n"
-            "`/music Arijit Singh`",
-            reply_markup=back_keyboard()
+            "`/music Arijit Singh`"
         )
 
         return
 
-    song = message.text.split(
-        " ",
-        1
-    )[1].strip()
+    query = " ".join(
+        message.command[1:]
+    ).strip()
 
     status = await message.reply_text(
-        f"🔎 Searching music...\n\n"
-        f"🎵 **{song}**"
+        "🔎 **Searching music...**"
     )
 
-    source_file = None
-    mp3_file = None
+    data, error = await asyncio.to_thread(
+        call_music_api,
+        query,
+    )
+
+    if error:
+
+        await status.edit_text(
+            "❌ **Music API Error**\n\n"
+            f"`{error}`"
+        )
+
+        return
+
+    results = parse_music_results(data)
+
+    if not results:
+
+        await status.edit_text(
+            "❌ **No music result found.**"
+        )
+
+        return
+
+    user_id = str(
+        message.from_user.id
+    )
+
+    music_cache[user_id] = results
+
+    buttons = []
+
+    for index, item in enumerate(results):
+
+        title = item["title"]
+
+        if len(title) > 35:
+            title = title[:32] + "..."
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"🎵 {index + 1}. {title}",
+                    callback_data=f"music:{index}",
+                )
+            ]
+        )
+
+    # Music result page can also have support
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "📢 Support",
+                url=SUPPORT_URL,
+            )
+        ]
+    )
+
+    await status.edit_text(
+        "🎵 **Music Results**\n\n"
+        f"🔎 Search: `{query}`\n\n"
+        "👇 Select a song:",
+        reply_markup=InlineKeyboardMarkup(
+            buttons
+        ),
+    )
+
+
+# ============================================================
+# MUSIC CALLBACK
+# ============================================================
+
+@app.on_callback_query(
+    filters.regex(r"^music:\d+$")
+)
+async def music_callback(
+    client,
+    callback_query,
+):
+
+    user_id = str(
+        callback_query.from_user.id
+    )
+
+    results = music_cache.get(
+        user_id
+    )
+
+    if not results:
+
+        await callback_query.answer(
+            "Search expired. Search again.",
+            show_alert=True,
+        )
+
+        return
 
     try:
 
-        data = search_music(song)
-
-        if not data.get("success"):
-
-            raise ValueError(
-                "Music API returned an error."
-            )
-
-        results = data.get(
-            "results",
-            []
+        index = int(
+            callback_query.data.split(":")[1]
         )
 
-        if (
-            not isinstance(results, list)
-            or not results
-        ):
+    except Exception:
+
+        await callback_query.answer(
+            "Invalid selection.",
+            show_alert=True,
+        )
+
+        return
+
+    if index < 0 or index >= len(results):
+
+        await callback_query.answer(
+            "Result not found.",
+            show_alert=True,
+        )
+
+        return
+
+    item = results[index]
+
+    await callback_query.answer(
+        "⏳ Preparing MP3..."
+    )
+
+    status = await callback_query.message.reply_text(
+        "🎵 **Preparing MP3...**\n\n"
+        f"🎧 {item['title']}\n"
+        "📥 Downloading audio..."
+    )
+
+    base_name = safe_filename(
+        f"music_{user_id}_{index}"
+    )
+
+    input_file = (
+        TEMP_DIR
+        / f"{base_name}.mp4"
+    )
+
+    mp3_file = (
+        TEMP_DIR
+        / f"{base_name}.mp3"
+    )
+
+    try:
+
+        # ----------------------------------------------------
+        # DOWNLOAD SOURCE
+        # ----------------------------------------------------
+
+        ok, size, error = await asyncio.to_thread(
+            download_file,
+            item["download_url"],
+            input_file,
+        )
+
+        if not ok:
 
             await status.edit_text(
-                "❌ **No music result found.**"
+                "❌ **Music Download Failed**\n\n"
+                f"`{error}`"
             )
 
             return
 
-        selected = None
+        if size <= 0:
 
-        for item in results:
-
-            if not isinstance(item, dict):
-                continue
-
-            download_url = item.get(
-                "download_url"
+            await status.edit_text(
+                "❌ Downloaded audio is empty."
             )
 
-            if valid_http_url(download_url):
+            return
 
-                selected = item
-                break
+        # ----------------------------------------------------
+        # CHECK SOURCE SIZE
+        # ----------------------------------------------------
 
-        if not selected:
+        if size > MAX_TELEGRAM_FILE:
 
-            raise ValueError(
-                "No downloadable music found."
+            await status.edit_text(
+                "❌ **Music File Too Large**\n\n"
+                f"Size: `{human_size(size)}`"
             )
 
-        title = (
-            selected.get("title")
-            or song
-        )
+            return
 
-        artists = (
-            selected.get("artists")
-            or "Unknown Artist"
-        )
-
-        album = (
-            selected.get("album")
-            or ""
-        )
-
-        duration = (
-            selected.get("duration")
-            or ""
-        )
-
-        download_url = selected.get(
-            "download_url"
-        )
+        # ----------------------------------------------------
+        # CONVERT MP4 -> MP3
+        # ----------------------------------------------------
 
         await status.edit_text(
-            "⬇️ **Downloading music...**\n\n"
-            f"🎵 {title}\n"
-            f"👤 {artists}"
+            "🎵 **Converting to MP3...**\n\n"
+            f"🎧 {item['title']}\n"
+            "🔧 Extracting audio..."
         )
 
-        source_file = TEMP_DIR / (
-            f"music_source_"
-            f"{message.from_user.id}_"
-            f"{int(time.time())}.mp4"
+        converted, convert_error = (
+            await asyncio.to_thread(
+                convert_to_mp3,
+                input_file,
+                mp3_file,
+            )
         )
 
-        download_file(
-            download_url,
-            source_file
-        )
+        if not converted:
+
+            await status.edit_text(
+                "❌ **MP3 Conversion Failed**\n\n"
+                f"`{convert_error}`"
+            )
+
+            return
+
+        mp3_size = mp3_file.stat().st_size
+
+        if mp3_size <= 0:
+
+            await status.edit_text(
+                "❌ MP3 file is empty."
+            )
+
+            return
+
+        if mp3_size > MAX_TELEGRAM_FILE:
+
+            await status.edit_text(
+                "❌ **MP3 File Too Large**\n\n"
+                f"Size: `{human_size(mp3_size)}`"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # UPLOAD MP3
+        # ----------------------------------------------------
 
         await status.edit_text(
-            "🎧 **Converting to MP3...**\n\n"
-            f"🎵 {title}"
-        )
-
-        mp3_file = TEMP_DIR / (
-            f"{re.sub(r'[^a-zA-Z0-9_-]+', '_', title)[:50]}_"
-            f"{int(time.time())}.mp3"
-        )
-
-        convert_to_mp3(
-            source_file,
-            mp3_file
-        )
-
-        size_mb = (
-            mp3_file.stat().st_size
-            / (1024 * 1024)
-        )
-
-        await status.edit_text(
-            "📤 **Uploading MP3...**"
+            "🎵 **Uploading MP3...**\n\n"
+            f"🎧 {item['title']}\n"
+            f"📦 {human_size(mp3_size)}"
         )
 
         caption = (
-            f"🎵 **{title}**\n\n"
-            f"👤 {artists}\n"
+            f"🎵 **{item['title']}**\n\n"
+            f"👤 {item['artists']}\n"
+            f"💿 {item['album']}\n"
+            f"⏱ {item['duration']}\n"
+            f"📦 {human_size(mp3_size)}\n\n"
+            "⚡ Powered by Misstu"
         )
 
-        if album:
-            caption += f"💿 {album}\n"
-
-        if duration:
-            caption += f"⏱ {duration}\n"
-
-        caption += (
-            f"📦 {size_mb:.1f} MB\n\n"
-            "⚡ Powered by **Misstu**"
-        )
-
-        await client.send_audio(
-            chat_id=message.chat.id,
+        await callback_query.message.reply_audio(
             audio=str(mp3_file),
             caption=caption,
-            title=title,
-            performer=artists,
-            duration=0
+            title=item["title"],
+            performer=item["artists"],
         )
 
         await status.delete()
 
+    except FloodWait as e:
+
+        print(
+            f"FloodWait: sleeping {e.value}s"
+        )
+
+        await asyncio.sleep(
+            e.value
+        )
+
     except Exception as e:
 
         print(
-            "[MUSIC ERROR]",
-            repr(e)
+            "Music processing error:",
+            repr(e),
         )
 
         try:
 
             await status.edit_text(
-                "❌ **Music download failed**\n\n"
-                f"`{str(e)[:1500]}`"
+                "❌ **Music Upload Failed**\n\n"
+                f"`{e}`"
             )
 
         except Exception:
@@ -1265,30 +1434,384 @@ async def music_handler(client, message):
 
     finally:
 
-        for file_path in [
-            source_file,
-            mp3_file
-        ]:
+        for file in (
+            input_file,
+            mp3_file,
+        ):
 
-            if file_path and file_path.exists():
+            try:
+                file.unlink(
+                    missing_ok=True
+                )
+            except Exception:
+                pass
+
+
+# ============================================================
+# MUSIC HELP
+# ============================================================
+
+@app.on_callback_query(
+    filters.regex("^music_help$")
+)
+async def music_help_callback(
+    client,
+    callback_query,
+):
+
+    await callback_query.answer()
+
+    await callback_query.message.reply_text(
+        "🎵 **Music Search**\n\n"
+        "Use:\n"
+        "`/music song name`\n\n"
+        "Example:\n"
+        "`/music Sanam Teri Kasam`"
+    )
+
+
+# ============================================================
+# VIDEO PROCESSING
+# ============================================================
+
+async def process_video(
+    client,
+    message,
+    url,
+    platform,
+):
+
+    status = await message.reply_text(
+        "⚡ **Searching Database...**\n\n"
+        "🔌 Connecting API..."
+    )
+
+    output = None
+    repaired = None
+
+    try:
+
+        await asyncio.sleep(0.4)
+
+        await status.edit_text(
+            "⚡ **Searching Database...**\n\n"
+            "🔌 Connecting API...\n"
+            "🔎 Searching records..."
+        )
+
+        data, error = await asyncio.to_thread(
+            call_video_api,
+            platform,
+            url,
+        )
+
+        if error:
+
+            await status.edit_text(
+                "❌ **API Error**\n\n"
+                f"{error}"
+            )
+
+            return
+
+        await status.edit_text(
+            "⚡ **Checking response...**\n\n"
+            "📡 Response received.\n"
+            "🎬 Finding best video..."
+        )
+
+        video_url = choose_best_video(
+            data,
+            platform,
+        )
+
+        if not video_url:
+
+            await status.edit_text(
+                "❌ **Video URL not found.**\n\n"
+                "API did not return a supported "
+                "video URL."
+            )
+
+            return
+
+        await status.edit_text(
+            "⚡ **Fetching information...**\n\n"
+            "📥 Downloading video..."
+        )
+
+        filename = safe_filename(
+            f"{platform}_{message.from_user.id}_{message.id}.mp4"
+        )
+
+        output = TEMP_DIR / filename
+
+        ok, size, error = await asyncio.to_thread(
+            download_file,
+            video_url,
+            output,
+        )
+
+        if not ok:
+
+            await status.edit_text(
+                "❌ **Download Failed**\n\n"
+                f"{error}"
+            )
+
+            return
+
+        if size <= 0:
+
+            await status.edit_text(
+                "❌ Downloaded file is empty."
+            )
+
+            return
+
+        if size > MAX_TELEGRAM_FILE:
+
+            await status.edit_text(
+                "❌ **File Too Large**\n\n"
+                f"Size: `{human_size(size)}`\n\n"
+                "Telegram upload limit reached."
+            )
+
+            return
+
+        await status.edit_text(
+            "⚡ **Finalizing result...**\n\n"
+            "🔧 Preparing playable MP4..."
+        )
+
+        repaired = (
+            TEMP_DIR
+            / f"fixed_{message.from_user.id}_{message.id}.mp4"
+        )
+
+        remux_success = await asyncio.to_thread(
+            remux_video,
+            output,
+            repaired,
+        )
+
+        upload_file = output
+
+        if remux_success:
+
+            repaired_size = repaired.stat().st_size
+
+            if (
+                repaired_size > 0
+                and repaired_size <= MAX_TELEGRAM_FILE
+            ):
+
+                upload_file = repaired
+                size = repaired_size
+
+        await status.edit_text(
+            "⚡ **Finalizing result...**\n\n"
+            f"📦 Size: `{human_size(size)}`\n"
+            "📤 Uploading to Telegram..."
+        )
+
+        caption = (
+            f"🎬 **{platform.title()} Video**\n\n"
+            f"📦 Size: `{human_size(size)}`\n"
+            "⚡ Powered by Misstu"
+        )
+
+        try:
+
+            await message.reply_video(
+                video=str(upload_file),
+                caption=caption,
+                supports_streaming=True,
+            )
+
+            await status.delete()
+
+        except Exception as upload_error:
+
+            await status.edit_text(
+                "❌ **Telegram Upload Failed**\n\n"
+                f"`{upload_error}`"
+            )
+
+    except FloodWait as e:
+
+        print(
+            f"FloodWait: sleeping {e.value}s"
+        )
+
+        await asyncio.sleep(
+            e.value
+        )
+
+    except Exception as e:
+
+        print(
+            "Video processing error:",
+            repr(e),
+        )
+
+        try:
+
+            await status.edit_text(
+                "❌ **Something went wrong**\n\n"
+                f"`{e}`"
+            )
+
+        except Exception:
+            pass
+
+    finally:
+
+        for file in (
+            output,
+            repaired,
+        ):
+
+            if file:
 
                 try:
-                    file_path.unlink()
+                    file.unlink(
+                        missing_ok=True
+                    )
                 except Exception:
                     pass
 
 
-# =========================================================
-# /USER
-# =========================================================
+# ============================================================
+# PRIVATE VIDEO HANDLER
+# ============================================================
 
-@bot.on_message(
+@app.on_message(
     filters.private
-    & filters.command(["user", "users"])
+    & filters.text
+    & ~filters.command(
+        [
+            "start",
+            "help",
+            "music",
+            "broadcast",
+            "broadcast_user",
+            "user",
+            "users",
+            "id",
+        ]
+    )
 )
-async def users_handler(client, message):
+async def private_video_handler(
+    client,
+    message,
+):
 
-    if message.from_user.id != ADMIN_ID:
+    if not message.from_user:
+        return
+
+    register_user(
+        message.from_user
+    )
+
+    url = extract_url(
+        message.text
+    )
+
+    if not url:
+        return
+
+    platform = detect_platform(
+        url
+    )
+
+    if not platform:
+        return
+
+    await process_video(
+        client,
+        message,
+        url,
+        platform,
+    )
+
+
+# ============================================================
+# GROUP VIDEO HANDLER
+# ============================================================
+
+@app.on_message(
+    filters.group
+    & filters.text
+)
+async def group_handler(
+    client,
+    message,
+):
+
+    if not message.from_user:
+        return
+
+    register_user(
+        message.from_user
+    )
+
+    if not message.text:
+        return
+
+    if message.text.startswith("/"):
+        return
+
+    url = extract_url(
+        message.text
+    )
+
+    if not url:
+        return
+
+    platform = detect_platform(
+        url
+    )
+
+    if not platform:
+        return
+
+    await process_video(
+        client,
+        message,
+        url,
+        platform,
+    )
+
+
+# ============================================================
+# ADMIN CHECK
+# ============================================================
+
+def is_admin(user_id):
+    return int(user_id) == ADMIN_ID
+
+
+# ============================================================
+# BROADCAST
+# ============================================================
+
+@app.on_message(
+    filters.private
+    & filters.command("broadcast")
+)
+async def broadcast_handler(
+    client,
+    message,
+):
+
+    register_user(
+        message.from_user
+    )
+
+    if not is_admin(
+        message.from_user.id
+    ):
 
         await message.reply_text(
             "❌ You are not authorized."
@@ -1296,43 +1819,213 @@ async def users_handler(client, message):
 
         return
 
-    with users_lock:
-        all_users = list(users.values())
-
-    if not all_users:
+    if len(message.command) < 2:
 
         await message.reply_text(
-            "👥 No users registered."
+            "Usage:\n"
+            "`/broadcast Your message`"
         )
 
         return
 
-    all_users.sort(
-        key=lambda x: x.get(
-            "last_seen",
-            0
-        ),
-        reverse=True
+    text = message.text.split(
+        None,
+        1,
+    )[1].strip()
+
+    if not text:
+
+        await message.reply_text(
+            "❌ Message is empty."
+        )
+
+        return
+
+    status = await message.reply_text(
+        "📢 **Broadcast started...**"
     )
 
-    current = (
-        "👥 **Social Media Bot Users**\n\n"
-        f"📊 Total: `{len(all_users)}`\n\n"
+    success = 0
+    failed = 0
+
+    for user_id in list(users.keys()):
+
+        try:
+
+            await client.send_message(
+                int(user_id),
+                text,
+            )
+
+            success += 1
+
+            await asyncio.sleep(0.05)
+
+        except FloodWait as e:
+
+            await asyncio.sleep(e.value)
+
+            try:
+
+                await client.send_message(
+                    int(user_id),
+                    text,
+                )
+
+                success += 1
+
+            except Exception:
+                failed += 1
+
+        except Exception:
+            failed += 1
+
+    await status.edit_text(
+        "📢 **Broadcast Completed**\n\n"
+        f"✅ Sent: `{success}`\n"
+        f"❌ Failed: `{failed}`\n"
+        f"👥 Total: `{len(users)}`"
     )
 
-    chunks = []
 
-    for index, user in enumerate(
-        all_users,
-        1
+# ============================================================
+# BROADCAST USER
+# ============================================================
+
+@app.on_message(
+    filters.private
+    & filters.command("broadcast_user")
+)
+async def broadcast_user_handler(
+    client,
+    message,
+):
+
+    register_user(
+        message.from_user
+    )
+
+    if not is_admin(
+        message.from_user.id
     ):
 
-        name = (
-            user.get("full_name")
+        await message.reply_text(
+            "❌ You are not authorized."
+        )
+
+        return
+
+    if len(message.command) < 3:
+
+        await message.reply_text(
+            "Usage:\n"
+            "`/broadcast_user USER_ID MESSAGE`"
+        )
+
+        return
+
+    try:
+
+        target_id = int(
+            message.command[1]
+        )
+
+    except ValueError:
+
+        await message.reply_text(
+            "❌ Invalid User ID."
+        )
+
+        return
+
+    text = message.text.split(
+        None,
+        2,
+    )[2].strip()
+
+    if not text:
+
+        await message.reply_text(
+            "❌ Message is empty."
+        )
+
+        return
+
+    try:
+
+        await client.send_message(
+            target_id,
+            text,
+        )
+
+        await message.reply_text(
+            "✅ Message sent successfully."
+        )
+
+    except Exception as e:
+
+        await message.reply_text(
+            f"❌ Failed:\n`{e}`"
+        )
+
+
+# ============================================================
+# USERS LIST
+# ============================================================
+
+@app.on_message(
+    filters.private
+    & filters.command(
+        [
+            "user",
+            "users",
+        ]
+    )
+)
+async def users_handler(
+    client,
+    message,
+):
+
+    register_user(
+        message.from_user
+    )
+
+    if not is_admin(
+        message.from_user.id
+    ):
+
+        await message.reply_text(
+            "❌ You are not authorized."
+        )
+
+        return
+
+    if not users:
+
+        await message.reply_text(
+            "👥 No users registered yet."
+        )
+
+        return
+
+    lines = [
+        "👥 **REGISTERED USERS**",
+        f"Total: `{len(users)}`",
+        "",
+    ]
+
+    for index, data in enumerate(
+        users.values(),
+        start=1,
+    ):
+
+        full_name = (
+            data.get("full_name")
             or "Unknown"
         )
 
-        username = user.get(
+        username = data.get(
             "username"
         )
 
@@ -1342,162 +2035,69 @@ async def users_handler(client, message):
             else "No username"
         )
 
-        uid = user.get(
-            "user_id"
+        user_id = data.get(
+            "user_id",
+            "Unknown",
         )
 
         user_type = (
-            "🤖 Bot"
-            if user.get("is_bot")
-            else "👤 User"
+            "BOT"
+            if data.get("is_bot")
+            else "USER"
         )
 
-        block = (
-            f"**{index}. {name}**\n"
-            f"├ Username: `{username_text}`\n"
-            f"├ ID: `{uid}`\n"
-            f"└ Type: {user_type}\n\n"
+        lines.append(
+            f"**{index}. {full_name}**\n"
+            f"├ ID: `{user_id}`\n"
+            f"├ Username: {username_text}\n"
+            f"└ Type: `{user_type}`\n"
         )
 
-        if len(current) + len(block) > 3800:
+    chunks = []
+    current = ""
+
+    for line in lines:
+
+        if len(current) + len(line) > 3800:
 
             chunks.append(current)
-            current = block
+            current = ""
 
-        else:
-
-            current += block
+        current += line + "\n"
 
     if current:
         chunks.append(current)
 
     for chunk in chunks:
-
-        await message.reply_text(
-            chunk
-        )
+        await message.reply_text(chunk)
 
 
-# =========================================================
-# /BROADCAST
-# =========================================================
+# ============================================================
+# MAIN
+# ============================================================
 
-@bot.on_message(
-    filters.private
-    & filters.command("broadcast")
-)
-async def broadcast_handler(client, message):
+if __name__ == "__main__":
 
-    if message.from_user.id != ADMIN_ID:
+    load_users()
 
-        await message.reply_text(
-            "❌ You are not authorized."
-        )
+    print("=" * 60)
+    print("🚀 MISSTU SOCIAL MEDIA DOWNLOADER")
+    print("=" * 60)
+    print(f"👥 Users: {len(users)}")
+    print("🎬 Video API: Configured")
+    print("🎵 Music API: Configured")
+    print("📢 Support: Configured")
+    print("🎵 Music output: MP3")
+    print("=" * 60)
 
-        return
-
-    if len(message.command) < 2:
-
-        await message.reply_text(
-            "📣 **Usage:**\n"
-            "`/broadcast Your message`"
-        )
-
-        return
-
-    broadcast_text = message.text.split(
-        " ",
-        1
-    )[1].strip()
-
-    with users_lock:
-        user_ids = list(users.keys())
-
-    status = await message.reply_text(
-        "📣 **Broadcast started...**\n\n"
-        f"👥 Total: `{len(user_ids)}`"
+    flask_thread = threading.Thread(
+        target=run_flask,
+        daemon=True,
     )
 
-    sent = 0
-    failed = 0
+    flask_thread.start()
 
-    for uid in user_ids:
+    print("🌐 Health server started.")
+    print("🤖 Starting Telegram bot...")
 
-        try:
-
-            await client.send_message(
-                int(uid),
-                broadcast_text
-            )
-
-            sent += 1
-
-            await asyncio.sleep(
-                0.05
-            )
-
-        except Exception as e:
-
-            failed += 1
-
-            print(
-                f"Broadcast error {uid}:",
-                repr(e)
-            )
-
-    await status.edit_text(
-        "✅ **Broadcast completed**\n\n"
-        f"📨 Sent: `{sent}`\n"
-        f"❌ Failed: `{failed}`\n"
-        f"👥 Total: `{len(user_ids)}`"
-    )
-
-
-# =========================================================
-# /PING
-# =========================================================
-
-@bot.on_message(
-    filters.private & filters.command("ping")
-)
-async def ping_handler(client, message):
-
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    start = time.time()
-
-    msg = await message.reply_text(
-        "🏓 Checking..."
-    )
-
-    ms = int(
-        (time.time() - start) * 1000
-    )
-
-    await msg.edit_text(
-        f"🏓 **Pong!**\n\n"
-        f"⚡ Response: `{ms} ms`\n"
-        f"🟢 Bot: Online"
-    )
-
-
-# =========================================================
-# START
-# =========================================================
-
-print()
-print("==========================================")
-print("       SOCIAL MEDIA DOWNLOADER")
-print("==========================================")
-print("🟢 Bot starting...")
-print("🌐 Health port:", PORT)
-print("📥 Video API:", "Configured")
-print("🎵 Music API:", "Configured")
-print("📢 Support:", "Configured")
-print("👥 Users:", len(users))
-print("🎧 FFmpeg MP3 conversion: ENABLED")
-print("==========================================")
-print()
-
-bot.run()
+    app.run()
