@@ -6,9 +6,9 @@ ENV PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# FFmpeg required for MP3 conversion
+# Required compiler for TgCrypto
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends gcc \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
