@@ -24,6 +24,8 @@ VIDEO_API_URL=
 MUSIC_API_URL=
 ```
 
+Note:- Set Video_Api_Url And Music_Api_url without endpoints 
+
 Every host/user should put their own Telegram credentials, support URL and API URLs here.
 
 ## Commands
