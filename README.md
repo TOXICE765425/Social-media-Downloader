@@ -22,9 +22,23 @@ ADMIN_ID=
 SUPPORT_URL=
 VIDEO_API_URL=
 MUSIC_API_URL=
+FIREBASE_DATABASE_URL=
+FIREBASE_SERVICE_ACCOUNT_JSON=
 ```
 
-Note:- Set Video_Api_Url And Music_Api_url without endpoints 
+All video platform endpoints and the complete music `/search?song=` endpoint are configured only through environment variables. They are not hard-coded in the bot source.
+
+### Firebase persistent users
+
+The bot stores users under the Firebase Realtime Database path `users/<telegram_user_id>`. On `/start`, the user's Telegram details are saved/updated, including ID, name, username, language, premium flag, first-seen time and last-seen time.
+
+The `/user` and `/users` commands read the current list directly from Firebase. `/broadcast` also loads the Firebase list before sending, so users are retained across restarts, redeployments and new deployments.
+
+Set these Firebase variables:
+- `FIREBASE_DATABASE_URL` — your Realtime Database URL.
+- `FIREBASE_SERVICE_ACCOUNT_JSON` — the complete Firebase Admin SDK service-account JSON as a single environment-variable value.
+
+Never commit the service-account JSON to GitHub.
 
 Every host/user should put their own Telegram credentials, support URL and API URLs here.
 

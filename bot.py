@@ -5,6 +5,10 @@ import asyncio
 import tempfile
 import threading
 import subprocess
+from urllib.parse import quote
+
+import firebase_admin
+from firebase_admin import credentials, db
 from pathlib import Path
 from datetime import datetime
 from html import unescape
@@ -26,9 +30,19 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-VIDEO_API_URL = os.getenv("VIDEO_API_URL", "").strip().rstrip("/")
-MUSIC_API_URL = os.getenv("MUSIC_API_URL", "").strip().rstrip("/")
+VIDEO_API_URL = os.getenv("VIDEO_API_URL", "").strip()
+MUSIC_API_URL = os.getenv("MUSIC_API_URL", "").strip()
+
+try:
+    VIDEO_API_ENDPOINTS = json.loads(VIDEO_API_URL) if VIDEO_API_URL else {}
+except json.JSONDecodeError as e:
+    raise RuntimeError("VIDEO_API_URL must contain valid JSON with complete platform endpoint URLs.") from e
+
+if not isinstance(VIDEO_API_ENDPOINTS, dict):
+    raise RuntimeError("VIDEO_API_URL must be a JSON object containing platform endpoint URLs.")
 SUPPORT_URL = os.getenv("SUPPORT_URL", "").strip()
+FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "").strip()
+FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
 
 
 # ============================================================
@@ -58,6 +72,12 @@ if not MUSIC_API_URL:
 if not SUPPORT_URL:
     missing.append("SUPPORT_URL")
 
+if not FIREBASE_DATABASE_URL:
+    missing.append("FIREBASE_DATABASE_URL")
+
+if not FIREBASE_SERVICE_ACCOUNT_JSON:
+    missing.append("FIREBASE_SERVICE_ACCOUNT_JSON")
+
 if missing:
     raise RuntimeError(
         "Missing Environment Variables: "
@@ -78,7 +98,6 @@ MAX_MUSIC_RESULTS = 10
 TEMP_DIR = Path(tempfile.gettempdir()) / "misstu_downloader"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-USER_DB = TEMP_DIR / "users.json"
 
 SUPPORTED_PLATFORMS = {
     "youtube": [
@@ -99,78 +118,103 @@ SUPPORTED_PLATFORMS = {
 
 
 # ============================================================
-# DATABASE
+# FIREBASE REALTIME DATABASE
 # ============================================================
 
 users = {}
 music_cache = {}
+
+firebase_ready = False
+
+
+def init_firebase():
+    global firebase_ready
+
+    try:
+        if firebase_admin._apps:
+            firebase_ready = True
+            return
+
+        service_account = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
+        cred = credentials.Certificate(service_account)
+        firebase_admin.initialize_app(
+            cred,
+            {"databaseURL": FIREBASE_DATABASE_URL},
+        )
+        firebase_ready = True
+        print("🔥 Firebase Realtime Database connected.")
+
+    except Exception as e:
+        firebase_ready = False
+        raise RuntimeError(f"Firebase initialization failed: {e}") from e
+
+
+def _firebase_get_users():
+    if not firebase_ready:
+        raise RuntimeError("Firebase is not initialized.")
+
+    data = db.reference("users").get()
+
+    if not isinstance(data, dict):
+        return {}
+
+    return data
+
+
+def _firebase_save_user(user_data):
+    if not firebase_ready:
+        raise RuntimeError("Firebase is not initialized.")
+
+    user_id = str(user_data["user_id"])
+    db.reference(f"users/{user_id}").set(user_data)
 
 
 def load_users():
     global users
 
     try:
-        if USER_DB.exists():
-            with open(USER_DB, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            if isinstance(data, dict):
-                users = data
-
+        users = _firebase_get_users()
+        print(f"🔥 Loaded {len(users)} users from Firebase.")
     except Exception as e:
-        print(f"⚠️ User database load error: {e}")
+        print(f"⚠️ Firebase user load error: {e}")
         users = {}
 
 
-def save_users():
-    try:
-        tmp_file = USER_DB.with_suffix(".tmp")
-
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(
-                users,
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
-
-        tmp_file.replace(USER_DB)
-
-    except Exception as e:
-        print(f"⚠️ User database save error: {e}")
-
-
-def register_user(user):
+def register_user(user, started=False):
     if not user:
         return
 
     user_id = str(user.id)
-
     old = users.get(user_id, {})
 
-    full_name = " ".join(
-        x for x in [
-            user.first_name or "",
-            user.last_name or "",
-        ]
-        if x
-    ).strip()
+    # Only /start creates a persistent Firebase record.
+    if not old and not started:
+        return
 
-    users[user_id] = {
+    # Keep Firebase intentionally minimal: only name, username and user ID.
+    full_name = " ".join(
+        x for x in [user.first_name or "", user.last_name or ""]
+        if x
+    ).strip() or "Unknown"
+
+    user_data = {
         "user_id": user.id,
-        "first_name": user.first_name or "",
-        "last_name": user.last_name or "",
-        "full_name": full_name or "Unknown",
+        "name": full_name,
         "username": user.username or "",
-        "is_bot": bool(user.is_bot),
-        "first_seen": old.get(
-            "first_seen",
-            datetime.utcnow().isoformat(),
-        ),
-        "last_seen": datetime.utcnow().isoformat(),
     }
 
-    save_users()
+    users[user_id] = user_data
+
+    try:
+        _firebase_save_user(user_data)
+    except Exception as e:
+        print(f"⚠️ Firebase user save error for {user_id}: {e}")
+
+
+def refresh_users_from_firebase():
+    global users
+    users = _firebase_get_users()
+    return users
 
 
 # ============================================================
@@ -621,17 +665,19 @@ def choose_best_video(data, platform):
 
 def call_video_api(platform, original_url):
 
-    endpoint = (
-        f"{VIDEO_API_URL}/api/{platform}"
-    )
+    endpoint = str(VIDEO_API_ENDPOINTS.get(platform, "")).strip()
+
+    if not endpoint:
+        return None, f"No API endpoint configured for {platform}."
+
+    # The complete endpoint (including its query parameter) lives in ENV.
+    # Only the user-supplied URL is appended; no platform path is hard-coded here.
+    request_url = endpoint + quote(original_url, safe="")
 
     try:
 
         response = requests.get(
-            endpoint,
-            params={
-                "url": original_url,
-            },
+            request_url,
             timeout=API_TIMEOUT,
             headers={
                 "User-Agent": "Mozilla/5.0",
@@ -824,7 +870,7 @@ async def send_welcome(client, message):
     if not user:
         return
 
-    register_user(user)
+    register_user(user, started=True)
 
     first_name = (
         user.first_name
@@ -984,31 +1030,20 @@ async def id_handler(client, message):
 
 def call_music_api(query):
 
+    endpoint = MUSIC_API_URL.strip()
+
+    if not endpoint:
+        return None, "Music API endpoint is not configured."
+
+    # The complete music endpoint, including /search?song=, lives in ENV.
+    request_url = endpoint + quote(query, safe="")
+
     try:
 
-        # ----------------------------------------------------
-        # IMPORTANT:
-        # API FORMAT:
-        # https://misstu-music-api.vercel.app/search?song=...
-        #
-        # If MUSIC_API_URL already ends with /search,
-        # don't add /search again.
-        # ----------------------------------------------------
-
-        if MUSIC_API_URL.lower().endswith("/search"):
-            endpoint = MUSIC_API_URL
-        else:
-            endpoint = f"{MUSIC_API_URL}/search"
-
-        print(
-            f"🎵 Music API Request: {endpoint}"
-        )
+        print(f"🎵 Music API Request: {endpoint}")
 
         response = requests.get(
-            endpoint,
-            params={
-                "song": query,
-            },
+            request_url,
             timeout=API_TIMEOUT,
             headers={
                 "User-Agent": "Mozilla/5.0",
@@ -1016,41 +1051,23 @@ def call_music_api(query):
             },
         )
 
-        print(
-            f"🎵 Music API Status: {response.status_code}"
-        )
+        print(f"🎵 Music API Status: {response.status_code}")
 
         response.raise_for_status()
 
         try:
             data = response.json()
         except Exception:
-            print(
-                "❌ Music API returned invalid JSON:"
-            )
-            print(
-                response.text[:2000]
-            )
+            print("❌ Music API returned invalid JSON")
             return None, "Music API returned invalid JSON."
 
-        # Debug information
         if isinstance(data, dict):
-            print(
-                "🎵 Music API Keys:",
-                list(data.keys())
-            )
+            print("🎵 Music API Keys:", list(data.keys()))
 
-            result_list = data.get(
-                "results",
-                []
-            )
-
-            print(
-                "🎵 Music Results Count:",
-                len(result_list)
-                if isinstance(result_list, list)
-                else "Not a list"
-            )
+            if isinstance(data.get("results"), list):
+                print("🎵 Music Results Count:", len(data["results"]))
+            elif isinstance(data.get("data"), list):
+                print("🎵 Music Results Count:", len(data["data"]))
 
         return data, None
 
@@ -1061,7 +1078,7 @@ def call_music_api(query):
         return None, f"Music API request failed: {e}"
 
     except Exception as e:
-        return None, str(e)
+        return None, f"Unexpected music API error: {e}"
 
 
 # ============================================================
@@ -1932,6 +1949,15 @@ async def broadcast_handler(
 
         return
 
+    try:
+        refresh_users_from_firebase()
+    except Exception as e:
+        await message.reply_text(
+            "❌ Could not load users from Firebase.\n\n"
+            f"`{e}`"
+        )
+        return
+
     status = await message.reply_text(
         "📢 **Broadcast started...**"
     )
@@ -2092,6 +2118,15 @@ async def users_handler(
 
         return
 
+    try:
+        refresh_users_from_firebase()
+    except Exception as e:
+        await message.reply_text(
+            "❌ Could not load users from Firebase.\n\n"
+            f"`{e}`"
+        )
+        return
+
     if not users:
 
         await message.reply_text(
@@ -2112,7 +2147,7 @@ async def users_handler(
     ):
 
         full_name = (
-            data.get("full_name")
+            data.get("name")
             or "Unknown"
         )
 
@@ -2131,17 +2166,10 @@ async def users_handler(
             "Unknown",
         )
 
-        user_type = (
-            "BOT"
-            if data.get("is_bot")
-            else "USER"
-        )
-
         lines.append(
             f"**{index}. {full_name}**\n"
             f"├ ID: `{user_id}`\n"
-            f"├ Username: {username_text}\n"
-            f"└ Type: `{user_type}`\n"
+            f"└ Username: {username_text}\n"
         )
 
     chunks = []
@@ -2169,6 +2197,7 @@ async def users_handler(
 
 if __name__ == "__main__":
 
+    init_firebase()
     load_users()
 
     print("=" * 60)

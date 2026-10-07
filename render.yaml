@@ -20,5 +20,9 @@ services:
         sync: false
       - key: MUSIC_API_URL
         sync: false
+      - key: FIREBASE_DATABASE_URL
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
       - key: PORT
         value: "10000"
